@@ -1,0 +1,79 @@
+# OVERVIEW
+
+TAHMO Incoming Solar Radiation Prediction Challenge
+Can you predict solar radiation when sensors can't be trusted?
+The Trans-African Hydro-Meteorological Observatory (TAHMO) operates over 600 weather stations across twenty-three African countries, providing the largest in-situ weather dataset in Africa. Maintaining high-quality observations across such a distributed network is essential for climate research, agriculture, water management, and renewable energy planning. Measuring incoming shortwave radiation reliably over long periods is challenging. The sensors are factory-calibrated at installation. However, after approximately two years of exposure to environmental conditions, sensors begin to drift in a nonlinear manner. This drift introduces systematic bias into radiation measurements, compromising data quality and downstream applications. The goal is to develop a machine learning solution capable of reconstructing true incoming shortwave radiation and enabling operational drift correction across TAHMO's network.
+
+Your task for this challenge is to predict incoming shortwave radiation at 15-minute interval for the missing even months of year 1 for each station.
+
+Evaluation
+This challenge uses multi-metric evaluation. There are two error metrics: Absolute Mean Bias Error (MBE) and Root Mean Squared Error (RMSE).
+
+To perform well in this challenge, your solution needs to be both correct in what it predicts.
+
+The final score on the leaderboard is the weighted mean of the two evaluation metrics.
+
+Metric        Weighting
+MBE           0.5
+RMSE          0.5
+           
+Absolute Mean Bias Error (MBE) measures the deviation from the observed value as: |MBE| = |mean(predicted - observed)|
+
+Root Mean Squared Error (RMSE) measures the average magnitude of prediction errors — how far predictions are from actual values, in the same units as the target.
+
+Your submission file must contain exactly 3 columns: ID, TargetMBE and TargetRMSE.
+
+The values in TargetMBE and TargetRMSE should be identical for each corresponding entry of the submission. This format is required for multi-metric evaluation.
+
+The order of the rows does not matter, but you must include predictions for entries in Test.csv. Your submission should look like this:
+
+ID                                 TargetMBE    TargetRMSE
+e1ca667d_2017-02_6DN3R0     3.461             3.461
+e1ca667d_2017-02_CA6DZ7     4.321             4.321                
+e1ca667d_2017-02_3UJPYF     2.789             2.789
+Prizes
+🥇 1st prize: $5 000 USD
+
+🥈2nd prize: $3 000 USD
+
+🥉3rd prize: $2 000 USD
+
+There are 10 000 Zindi points available. You can read more about Zindi points here.
+
+
+
+# DATA SECTION
+The dataset consists of data recorded at 15-minute intervals from 50 TAHMO stations during the first year after installation, when the radiation sensors are assumed to be properly calibrated. The radiation data of each station for the odd months is provided for training, whereas the data for the even months is withheld for testing. Temperature, relative humidity and rainfall are available for the full year. A full description of the dataset and its features is given in dataset_data_dictionary.csv
+
+In addition, you are required to source and download public earth observation data to complement the provided data. You are encouraged to share the code used to download the data so that it is available to all participants. Your solution must also include the preprocessing code for any extra data. Suggested sources include:
+
+LANDSAF
+TROPOMI
+A full description of the dataset and its features is given in dataset_data_dictionary.csv
+
+Files
+Description
+Files
+This is the training dataset.
+
+Train.csv
+75.4 MB
+This file has the data for model testing.
+
+Test.csv
+77 MB
+This file shows the format of your submission file.
+
+SampleSubmission.csv
+20.9 MB
+This starter notebook demonstrates how to make a submission.
+
+tahmo_starter_notebook.ipynb
+969.5 KB
+Description of the dataset's features.
+
+dataset_data_dictionary.csv
+854 B
+
+# NOTABLE CHATS
+

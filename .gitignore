@@ -1,0 +1,62 @@
+# Competition data (large, redistributable only via Zindi)
+data/raw/*
+!data/raw/.gitkeep
+
+# Satellite extractions (large, regenerable via shell/run_*.sh)
+data/satellite/*
+!data/satellite/.gitkeep
+
+# Processed data — keep only the v20 feature matrix (LFS) + tiny reference files.
+# Larger CSVs are regenerable via shell/run_prepare.sh + shell/run_merge.sh.
+data/processed/*
+!data/processed/.gitkeep
+!data/processed/v20_train.parquet
+!data/processed/v20_test.parquet
+!data/processed/v20_feature_list.json
+!data/processed/night_offset_per_station.csv
+!data/processed/station_anomaly_scores.csv
+
+# Submissions (regenerable training outputs, ~3GB)
+submissions/
+
+# Bulk archive
+data.zip
+
+# Secrets — committing these leaks API keys / passwords
+keys.md
+shell/_env.sh
+.cdsapirc
+
+# Atomic-write temp files from data_pipeline.py
+*.csv.tmp
+*.nc.tmp
+
+# Python housekeeping
+__pycache__/
+*.pyc
+*.pyo
+.python-version
+.venv/
+venv/
+
+# Jupyter housekeeping
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs
+logs/
+*.log
+
+# Local caches & tooling state
+.cache/
+.claude/
+
+# Working notes (not part of the project)
+pickup from here.txt
+setup_claude.sh
