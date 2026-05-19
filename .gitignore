@@ -17,7 +17,12 @@ data/processed/*
 !data/processed/station_anomaly_scores.csv
 
 # Submissions (regenerable training outputs, ~3GB)
-submissions/
+submissions/*
+# Keep the three pseudo-label sources that v20's trainer reads at
+# pseudo-build time — without them a fresh clone can't reproduce v20.
+!submissions/lgbm_v12_shift_n150.csv
+!submissions/lgbm_v16_mdssftd.csv
+!submissions/lgbm_v18_mdss_pseudo.csv
 
 # Bulk archive
 data.zip

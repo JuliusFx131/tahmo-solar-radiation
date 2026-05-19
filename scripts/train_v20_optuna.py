@@ -56,6 +56,11 @@ DAYTIME_ELEV_THR  = 5.0
 TRIALS = {"lgbm": 20, "xgb": 20, "hgb": 20, "cat": 12}
 SEED = 42
 
+# GPU mode (toggled by --gpu CLI flag).  XGB and CatBoost get CUDA;
+# LightGBM stays CPU because the pip wheel isn't built with GPU support,
+# and HistGradientBoosting has no GPU implementation in sklearn.
+USE_GPU = False
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Shared helpers
@@ -396,6 +401,8 @@ def run_xgb(features, cat_features):
             reg_lambda=trial.suggest_float("reg_lambda", 1e-3, 10.0, log=True),
             nthread=-1, seed=SEED,
         )
+        if USE_GPU:
+            params["device"] = "cuda"
         m = xgb.train(params, dtr, num_boost_round=1500,
                       evals=[(dva, "val")], early_stopping_rounds=40, verbose_eval=False)
         score = float(m.best_score)
@@ -408,6 +415,8 @@ def run_xgb(features, cat_features):
     best = dict(study.best_params)
     best.update(objective="reg:squarederror", eval_metric="rmse",
                 tree_method="hist", nthread=-1, seed=SEED)
+    if USE_GPU:
+        best["device"] = "cuda"
     log.info(f"[XGB] best RMSE on holdout: {study.best_value:.3f}")
     log.info(f"[XGB] best params: {study.best_params}")
     del dtr, dva, study; gc.collect()
@@ -611,9 +620,13 @@ def run_cat(features, cat_features):
             l2_leaf_reg=trial.suggest_float("l2_leaf_reg", 1.0, 10.0, log=True),
             random_strength=trial.suggest_float("random_strength", 0.5, 5.0),
             border_count=trial.suggest_int("border_count", 64, 254),
-            random_seed=SEED, thread_count=-1, verbose=False,
+            random_seed=SEED, verbose=False,
             early_stopping_rounds=40,
         )
+        if USE_GPU:
+            params["task_type"] = "GPU"
+        else:
+            params["thread_count"] = -1
         m = CatBoostRegressor(**params)
         m.fit(tr_pool, eval_set=va_pool)
         score = float(m.best_score_["validation"]["RMSE"])
@@ -654,8 +667,12 @@ def run_cat(features, cat_features):
                         l2_leaf_reg=best["l2_leaf_reg"],
                         random_strength=best["random_strength"],
                         border_count=best["border_count"],
-                        random_seed=SEED, thread_count=-1, verbose=False,
+                        random_seed=SEED, verbose=False,
                         early_stopping_rounds=40)
+    if USE_GPU:
+        refit_params["task_type"] = "GPU"
+    else:
+        refit_params["thread_count"] = -1
     for fold_idx, (tr_idx, va_idx) in enumerate(gkf.split(X_aug, y_aug, groups_aug)):
         tr_pool = Pool(X_aug.iloc[tr_idx], label=y_aug[tr_idx],
                        weight=w_aug[tr_idx], cat_features=cat_idx)
@@ -705,8 +722,15 @@ RUNNERS = {"lgbm": run_lgbm, "xgb": run_xgb, "hgb": run_hgb, "cat": run_cat}
 
 
 def main():
-    which = (sys.argv[1] if len(sys.argv) > 1 else "all").lower()
-    log.info(f"Run target: {which}")
+    global USE_GPU
+    args = [a for a in sys.argv[1:] if a != "--gpu"]
+    USE_GPU = "--gpu" in sys.argv[1:]
+    which = (args[0] if args else "all").lower()
+    log.info(f"Run target: {which}  GPU mode: {USE_GPU}")
+    if USE_GPU:
+        log.info("  --gpu enabled: XGB→device=cuda, CatBoost→task_type=GPU. "
+                 "LightGBM and HistGradientBoosting stay on CPU (no GPU support "
+                 "in the default pip wheels).")
     # Each runner reloads parquets internally to guarantee fresh memory state
     # — avoids OOM when running all 4 in sequence under the 8 GB cgroup.
     train_peek, _, features, cat_features = load_data()
