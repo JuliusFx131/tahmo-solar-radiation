@@ -131,6 +131,82 @@ def apply_night_override(test_meta, test_pred, per_hour, per_sta, fallback):
     return np.clip(out, 0, 1361)
 
 
+def build_aug_frame_inplace(train, test, pseudo, features, cat_features):
+    """
+    Build the augmented DataFrame (train + confident-test pseudo rows) by
+    pre-allocating one numpy array per column and filling each [train|pseudo]
+    slice once.  Avoids the pd.concat OOM peak where train + test_sub + concat
+    result + buffer copies all live simultaneously.
+
+    Peak memory ≈ train + test_sub + aug + one column-buffer at a time.
+    """
+    pseudo_target = pseudo.set_index(ID)[TARGET].astype(np.float32)
+    keep_mask = test[ID].isin(pseudo_target.index).values
+    n_train, n_pseudo = len(train), int(keep_mask.sum())
+    n_total = n_train + n_pseudo
+    test_sub = test.loc[keep_mask]
+    log.info(f"  building aug frame: n_train={n_train:,} + n_pseudo={n_pseudo:,} "
+             f"= {n_total:,}")
+
+    out = {}
+    for col in features + [TARGET, ID, "timestamp"]:
+        if col == TARGET:
+            arr = np.empty(n_total, dtype=np.float32)
+            arr[:n_train] = train[TARGET].values.astype(np.float32, copy=False)
+            arr[n_train:] = test_sub[ID].map(pseudo_target).astype(np.float32).values
+            out[col] = arr
+        elif col == ID:
+            arr = np.empty(n_total, dtype=object)
+            arr[:n_train] = train[ID].values
+            arr[n_train:] = test_sub[ID].values
+            out[col] = arr
+        elif col == "timestamp":
+            arr = np.empty(n_total, dtype="datetime64[ns]")
+            arr[:n_train] = train["timestamp"].values
+            arr[n_train:] = test_sub["timestamp"].values
+            out[col] = arr
+        elif col in cat_features:
+            cats = train[col].cat.categories
+            arr = np.empty(n_total, dtype=object)
+            arr[:n_train] = train[col].astype(str).values
+            arr[n_train:] = test_sub[col].astype(str).values
+            out[col] = pd.Categorical(arr, categories=cats)
+            del arr
+        else:
+            arr = np.empty(n_total, dtype=np.float32)
+            arr[:n_train] = train[col].values.astype(np.float32, copy=False)
+            arr[n_train:] = test_sub[col].values.astype(np.float32, copy=False)
+            out[col] = arr
+
+    origin = np.empty(n_total, dtype=object)
+    origin[:n_train] = "train"
+    origin[n_train:] = "pseudo"
+    out["_origin"] = origin
+
+    aug = pd.DataFrame(out)
+    del out, test_sub, pseudo_target; gc.collect()
+    aug = aug.sort_values(["station", "timestamp"]).reset_index(drop=True) \
+        if "station" in aug.columns else aug.sort_values(["timestamp"]).reset_index(drop=True)
+    return aug
+
+
+def to_float32_numpy(df, features, cat_features):
+    """
+    Pack DataFrame columns into a single contiguous float32 2D numpy array.
+    Categorical columns are stored as their integer codes cast to float32
+    (HGB and LGBM accept this; XGB treats them as ordinal which is fine for
+    low-cardinality station/country).  Avoids the pandas .values upcast to
+    float64 when dtypes are heterogeneous.
+    """
+    X = np.empty((len(df), len(features)), dtype=np.float32)
+    for j, col in enumerate(features):
+        if col in cat_features:
+            X[:, j] = df[col].cat.codes.values.astype(np.float32)
+        else:
+            X[:, j] = df[col].values.astype(np.float32, copy=False)
+    return X
+
+
 def save_outputs(model_name, oof_pred, train_ids, test_pred, test_ids, best_params,
                  cv_folds, oof_score, oof_mbe, oof_rmse, wall_s, n_pseudo):
     tag = f"{model_name}_v20_optuna"
@@ -226,28 +302,18 @@ def run_lgbm(features, cat_features):
     del ds_tr_search, ds_va_search, y_orig, groups, tr_mask, va_mask
     gc.collect()
 
-    # --- Step 2: pseudo-labels ---
+    # --- Step 2: pseudo-labels (memory-safe in-place build) ---
     pseudo = build_pseudo(test)
-    pseudo_map = pseudo.set_index(ID)[TARGET]
-    test_with_target = test[test[ID].isin(pseudo_map.index)].copy()
-    test_with_target[TARGET] = test_with_target[ID].map(pseudo_map).astype(np.float32)
-    train["_origin"] = "train"
-    test_with_target["_origin"] = "pseudo"
-    log.info(f"[LGBM] augmenting {len(train):,} train + {len(test_with_target):,} pseudo")
-    aug = pd.concat([train, test_with_target], ignore_index=True, copy=False)
-    del train, test_with_target, pseudo, pseudo_map; gc.collect()
-    aug = aug.sort_values(["station","timestamp"]).reset_index(drop=True)
-
-    # Extract the numeric arrays then drop the DataFrame
-    y_aug = aug[TARGET].values.astype(np.float32)
+    aug = build_aug_frame_inplace(train, test, pseudo, features, cat_features)
+    del train, pseudo; gc.collect()
+    y_aug = aug[TARGET].values
     w_aug = np.where(aug["_origin"].values == "pseudo",
                      np.float32(PSEUDO_WEIGHT), np.float32(1.0))
     origin_arr = aug["_origin"].values.copy()
     groups_aug = aug["timestamp"].dt.month.values
-    orig_train_ids = aug.loc[aug["_origin"]=="train", ID].values.copy()
+    orig_train_ids = aug.loc[aug["_origin"] == "train", ID].values.copy()
     n_pseudo = int((origin_arr == "pseudo").sum())
-    X_aug = aug[features].copy()
-    del aug; gc.collect()
+    X_aug = aug[features]   # no .copy(); fold slices materialise per Dataset
 
     # --- Step 3: refit best params, 6-fold CV ---
     log.info("[LGBM] refit with best params, 6-fold CV ...")
@@ -341,24 +407,16 @@ def run_xgb(features, cat_features):
     del dtr, dva, y, groups, tr_mask, va_mask; gc.collect()
 
     pseudo = build_pseudo(test)
-    pseudo_map = pseudo.set_index(ID)[TARGET]
-    test_with_target = test[test[ID].isin(pseudo_map.index)].copy()
-    test_with_target[TARGET] = test_with_target[ID].map(pseudo_map).astype(np.float32)
-    train["_origin"] = "train"
-    test_with_target["_origin"] = "pseudo"
-    log.info(f"[XGB] augmenting {len(train):,} train + {len(test_with_target):,} pseudo")
-    aug = pd.concat([train, test_with_target], ignore_index=True, copy=False)
-    del train, test_with_target, pseudo, pseudo_map; gc.collect()
-    aug = aug.sort_values(["station","timestamp"]).reset_index(drop=True)
-    y_aug = aug[TARGET].values.astype(np.float32)
+    aug = build_aug_frame_inplace(train, test, pseudo, features, cat_features)
+    del train, pseudo; gc.collect()
+    y_aug = aug[TARGET].values
     w_aug = np.where(aug["_origin"].values == "pseudo",
                      np.float32(PSEUDO_WEIGHT), np.float32(1.0))
     origin_arr = aug["_origin"].values.copy()
     groups_aug = aug["timestamp"].dt.month.values
-    orig_train_ids = aug.loc[aug["_origin"]=="train", ID].values.copy()
+    orig_train_ids = aug.loc[aug["_origin"] == "train", ID].values.copy()
     n_pseudo = int((origin_arr == "pseudo").sum())
-    X_aug = aug[features].copy()
-    del aug; gc.collect()
+    X_aug = aug[features]
 
     log.info("[XGB] refit best params, 6-fold CV ...")
     gkf = GroupKFold(n_splits=6)
@@ -461,27 +519,17 @@ def run_hgb(features, cat_features):
     del Xtr, Xva, ytr, yva, y, groups, tr_mask, va_mask; gc.collect()
 
     pseudo = build_pseudo(test)
-    pseudo_map = pseudo.set_index(ID)[TARGET]
-    test_with_target = test[test[ID].isin(pseudo_map.index)].copy()
-    test_with_target[TARGET] = test_with_target[ID].map(pseudo_map).astype(np.float32)
-    train["_origin"] = "train"
-    test_with_target["_origin"] = "pseudo"
-    log.info(f"[HGB] augmenting {len(train):,} train + {len(test_with_target):,} pseudo")
-    aug = pd.concat([train, test_with_target], ignore_index=True, copy=False)
-    del train, test_with_target, pseudo, pseudo_map; gc.collect()
-    aug = aug.sort_values(["station","timestamp"]).reset_index(drop=True)
-    y_aug = aug[TARGET].values.astype(np.float32)
+    aug = build_aug_frame_inplace(train, test, pseudo, features, cat_features)
+    del train, pseudo; gc.collect()
+    y_aug = aug[TARGET].values
     w_aug = np.where(aug["_origin"].values == "pseudo",
                      np.float32(PSEUDO_WEIGHT), np.float32(1.0))
     origin_arr = aug["_origin"].values.copy()
     groups_aug = aug["timestamp"].dt.month.values
-    orig_train_ids = aug.loc[aug["_origin"]=="train", ID].values.copy()
+    orig_train_ids = aug.loc[aug["_origin"] == "train", ID].values.copy()
     n_pseudo = int((origin_arr == "pseudo").sum())
-    X_aug = aug[features].copy()
-    for c in cat_features:
-        X_aug[c] = X_aug[c].cat.codes.astype("int32")
-    X_aug_np = X_aug.values
-    del aug, X_aug; gc.collect()
+    X_aug_np = to_float32_numpy(aug, features, cat_features)
+    del aug; gc.collect()
 
     log.info("[HGB] refit best params, 6-fold CV ...")
     gkf = GroupKFold(n_splits=6)
@@ -525,16 +573,16 @@ def run_hgb(features, cat_features):
     refit_params["max_iter"] = best_iter
     final = HistGradientBoostingRegressor(**refit_params)
     final.fit(X_aug_np, y_aug, sample_weight=w_aug)
-    Xtest = test[features].copy()
-    for c in cat_features:
-        Xtest[c] = Xtest[c].cat.codes.astype("int32")
-    test_pred = final.predict(Xtest.values).astype(np.float32)
+    del X_aug_np, y_aug, w_aug; gc.collect()
+    Xtest_np = to_float32_numpy(test, features, cat_features)
+    test_pred = final.predict(Xtest_np).astype(np.float32)
+    del Xtest_np; gc.collect()
     per_hour, per_sta, fb = build_night_override()
     test_pred = apply_night_override(test, test_pred, per_hour, per_sta, fb)
 
     save_outputs("hgb", oof_orig, orig_train_ids, test_pred, test[ID].values,
                  best, fold_meta, sc_a, mbe_a, rmse_a, time.time()-t0, n_pseudo)
-    del test, Xtest, final; gc.collect()
+    del test, final; gc.collect()
 
 
 def run_cat(features, cat_features):
@@ -581,27 +629,19 @@ def run_cat(features, cat_features):
     del tr_pool, va_pool, y, groups, tr_mask, va_mask; gc.collect()
 
     pseudo = build_pseudo(test)
-    pseudo_map = pseudo.set_index(ID)[TARGET]
-    test_with_target = test[test[ID].isin(pseudo_map.index)].copy()
-    test_with_target[TARGET] = test_with_target[ID].map(pseudo_map).astype(np.float32)
-    train["_origin"] = "train"
-    test_with_target["_origin"] = "pseudo"
-    log.info(f"[CAT] augmenting {len(train):,} train + {len(test_with_target):,} pseudo")
-    aug = pd.concat([train, test_with_target], ignore_index=True, copy=False)
-    del train, test_with_target, pseudo, pseudo_map; gc.collect()
-    aug = aug.sort_values(["station","timestamp"]).reset_index(drop=True)
-    y_aug = aug[TARGET].values.astype(np.float32)
+    aug = build_aug_frame_inplace(train, test, pseudo, features, cat_features)
+    del train, pseudo; gc.collect()
+    y_aug = aug[TARGET].values
     w_aug = np.where(aug["_origin"].values == "pseudo",
                      np.float32(PSEUDO_WEIGHT), np.float32(1.0))
     origin_arr = aug["_origin"].values.copy()
     groups_aug = aug["timestamp"].dt.month.values
-    orig_train_ids = aug.loc[aug["_origin"]=="train", ID].values.copy()
+    orig_train_ids = aug.loc[aug["_origin"] == "train", ID].values.copy()
     n_pseudo = int((origin_arr == "pseudo").sum())
     X_aug = aug[features].copy()
     for c in cat_features:
         X_aug[c] = X_aug[c].astype(str)
     del aug; gc.collect()
-    n_pseudo = (origin_arr == "pseudo").sum()
 
     log.info("[CAT] refit best params, 6-fold CV ...")
     gkf = GroupKFold(n_splits=6)
