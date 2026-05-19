@@ -27,7 +27,7 @@ from sklearn.model_selection import GroupKFold
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
-optuna.logging.set_verbosity(optuna.logging.WARNING)
+optuna.logging.set_verbosity(optuna.logging.INFO)  # show trial results in log
 
 ROOT = Path(__file__).resolve().parent.parent
 PROC = ROOT / "data" / "processed"
@@ -260,15 +260,18 @@ def run_lgbm(features, cat_features):
     va_mask = ~tr_mask
     log.info(f"  optuna val rows: {va_mask.sum():,}  train rows: {tr_mask.sum():,}")
 
-    # Pre-build the two Datasets once and reuse across trials (LGBM is fine with this).
+    # Pre-build the two Datasets once and reuse across trials.  Force eager
+    # construct() so LGBM copies into its binary format, then drop the source
+    # DataFrame for the Optuna phase — keeps memory <4 GB during search.
     ds_tr_search = lgb.Dataset(train[features].iloc[tr_mask.nonzero()[0]],
                                label=y_orig[tr_mask],
-                               categorical_feature=cat_features,
-                               free_raw_data=False)
+                               categorical_feature=cat_features)
     ds_va_search = lgb.Dataset(train[features].iloc[va_mask.nonzero()[0]],
                                label=y_orig[va_mask],
                                categorical_feature=cat_features,
-                               free_raw_data=False)
+                               reference=ds_tr_search)
+    ds_tr_search.construct(); ds_va_search.construct()
+    del train, test, y_orig, groups, tr_mask, va_mask; gc.collect()
 
     def objective(trial):
         params = dict(
@@ -297,12 +300,10 @@ def run_lgbm(features, cat_features):
                 verbose=-1, n_jobs=-1, seed=SEED)
     log.info(f"[LGBM] best RMSE on holdout: {study.best_value:.3f}")
     log.info(f"[LGBM] best params: {study.best_params}")
-
-    # FREE search artifacts before pseudo-label step
-    del ds_tr_search, ds_va_search, y_orig, groups, tr_mask, va_mask
-    gc.collect()
+    del ds_tr_search, ds_va_search, study; gc.collect()
 
     # --- Step 2: pseudo-labels (memory-safe in-place build) ---
+    train, test, _, _ = load_data()
     pseudo = build_pseudo(test)
     aug = build_aug_frame_inplace(train, test, pseudo, features, cat_features)
     del train, pseudo; gc.collect()
@@ -378,6 +379,9 @@ def run_xgb(features, cat_features):
                       label=y[tr_mask], enable_categorical=True)
     dva = xgb.DMatrix(train[features].iloc[va_mask.nonzero()[0]],
                       label=y[va_mask], enable_categorical=True)
+    # DMatrix has internalised the data; free the DataFrames during the
+    # Optuna phase to keep RSS under control.  Reloaded for pseudo-aug below.
+    del train, test, y, groups, tr_mask, va_mask; gc.collect()
 
     def objective(trial):
         params = dict(
@@ -394,7 +398,9 @@ def run_xgb(features, cat_features):
         )
         m = xgb.train(params, dtr, num_boost_round=1500,
                       evals=[(dva, "val")], early_stopping_rounds=40, verbose_eval=False)
-        return m.best_score
+        score = float(m.best_score)
+        del m; gc.collect()
+        return score
 
     study = optuna.create_study(direction="minimize",
                                 sampler=optuna.samplers.TPESampler(seed=SEED))
@@ -404,8 +410,9 @@ def run_xgb(features, cat_features):
                 tree_method="hist", nthread=-1, seed=SEED)
     log.info(f"[XGB] best RMSE on holdout: {study.best_value:.3f}")
     log.info(f"[XGB] best params: {study.best_params}")
-    del dtr, dva, y, groups, tr_mask, va_mask; gc.collect()
+    del dtr, dva, study; gc.collect()
 
+    train, test, _, _ = load_data()
     pseudo = build_pseudo(test)
     aug = build_aug_frame_inplace(train, test, pseudo, features, cat_features)
     del train, pseudo; gc.collect()
@@ -467,18 +474,16 @@ def run_hgb(features, cat_features):
     log.info("[HGB] starting Optuna + pseudo-label refit")
     train, test, _, _ = load_data()
     cat_idx = [features.index(c) for c in cat_features]
-    X = train[features].copy()
-    for c in cat_features:
-        X[c] = X[c].cat.codes.astype("int32")
+    X_full = to_float32_numpy(train, features, cat_features)
     y = train[TARGET].values.astype(np.float32)
     groups = train["timestamp"].dt.month.values
     val_months = [2, 11]
     tr_mask = ~pd.Series(groups).isin(val_months).values
     va_mask = ~tr_mask
-    Xtr = X.iloc[tr_mask.nonzero()[0]].values
-    Xva = X.iloc[va_mask.nonzero()[0]].values
+    Xtr = X_full[tr_mask.nonzero()[0]]
+    Xva = X_full[va_mask.nonzero()[0]]
     ytr = y[tr_mask]; yva = y[va_mask]
-    del X; gc.collect()
+    del train, test, X_full, y, groups, tr_mask, va_mask; gc.collect()
 
     def objective(trial):
         params = dict(
@@ -487,27 +492,17 @@ def run_hgb(features, cat_features):
             max_leaf_nodes=trial.suggest_int("max_leaf_nodes", 31, 127),
             min_samples_leaf=trial.suggest_int("min_samples_leaf", 50, 300),
             l2_regularization=trial.suggest_float("l2_regularization", 1e-3, 10.0, log=True),
-            max_iter=1500, early_stopping=True, n_iter_no_change=40,
-            validation_fraction=None, scoring="loss",
+            max_iter=1500, early_stopping=False,
             categorical_features=cat_idx, random_state=SEED,
         )
         m = HistGradientBoostingRegressor(**params)
-        # HGB requires explicit validation = we use its internal early-stopping
-        # by passing a validation fraction; for the Optuna holdout, we score on the
-        # held-out month manually.
-        # Use fit with early stopping then check on held-out months
-        params["early_stopping"] = False  # disable internal — we'll score manually
-        params.pop("validation_fraction", None)
-        params.pop("scoring", None)
-        params.pop("n_iter_no_change", None)
-        m = HistGradientBoostingRegressor(**params)
         m.fit(Xtr, ytr)
-        # Use staged_predict to find best_iter
         best_rmse = float("inf")
         for pred in m.staged_predict(Xva):
-            rmse = float(np.sqrt(np.mean((pred - yva)**2)))
+            rmse = float(np.sqrt(np.mean((pred - yva) ** 2)))
             if rmse < best_rmse:
                 best_rmse = rmse
+        del m; gc.collect()
         return best_rmse
 
     study = optuna.create_study(direction="minimize",
@@ -516,7 +511,9 @@ def run_hgb(features, cat_features):
     best = dict(study.best_params)
     log.info(f"[HGB] best RMSE on holdout: {study.best_value:.3f}")
     log.info(f"[HGB] best params: {best}")
-    del Xtr, Xva, ytr, yva, y, groups, tr_mask, va_mask; gc.collect()
+    del Xtr, Xva, ytr, yva, study; gc.collect()
+
+    train, test, _, _ = load_data()
 
     pseudo = build_pseudo(test)
     aug = build_aug_frame_inplace(train, test, pseudo, features, cat_features)
@@ -591,18 +588,19 @@ def run_cat(features, cat_features):
     log.info("=" * 60)
     log.info("[CAT] starting Optuna + pseudo-label refit")
     train, test, _, _ = load_data()
-    X = train[features].copy()
-    for c in cat_features:
-        X[c] = X[c].astype(str)
     y = train[TARGET].values.astype(np.float32)
     groups = train["timestamp"].dt.month.values
     val_months = [2, 11]
     tr_mask = ~pd.Series(groups).isin(val_months).values
     va_mask = ~tr_mask
     cat_idx = [features.index(c) for c in cat_features]
+    X = train[features].copy()
+    for c in cat_features:
+        X[c] = X[c].astype(str)
     tr_pool = Pool(X.iloc[tr_mask.nonzero()[0]], label=y[tr_mask], cat_features=cat_idx)
     va_pool = Pool(X.iloc[va_mask.nonzero()[0]], label=y[va_mask], cat_features=cat_idx)
-    del X; gc.collect()
+    # Pool has internalised the data — free the DataFrames during search.
+    del X, train, test, y, groups, tr_mask, va_mask; gc.collect()
 
     def objective(trial):
         params = dict(
@@ -618,7 +616,9 @@ def run_cat(features, cat_features):
         )
         m = CatBoostRegressor(**params)
         m.fit(tr_pool, eval_set=va_pool)
-        return float(m.best_score_["validation"]["RMSE"])
+        score = float(m.best_score_["validation"]["RMSE"])
+        del m; gc.collect()
+        return score
 
     study = optuna.create_study(direction="minimize",
                                 sampler=optuna.samplers.TPESampler(seed=SEED))
@@ -626,8 +626,9 @@ def run_cat(features, cat_features):
     best = dict(study.best_params)
     log.info(f"[CAT] best RMSE on holdout: {study.best_value:.3f}")
     log.info(f"[CAT] best params: {best}")
-    del tr_pool, va_pool, y, groups, tr_mask, va_mask; gc.collect()
+    del tr_pool, va_pool, study; gc.collect()
 
+    train, test, _, _ = load_data()
     pseudo = build_pseudo(test)
     aug = build_aug_frame_inplace(train, test, pseudo, features, cat_features)
     del train, pseudo; gc.collect()
